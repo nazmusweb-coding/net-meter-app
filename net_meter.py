@@ -3,8 +3,10 @@ import json
 import os
 import sys
 import subprocess
+import ssl
 import urllib.request
 import urllib.error
+import certifi
 from datetime import datetime, date
 import tkinter as tk
 from tkinter import messagebox
@@ -226,11 +228,15 @@ class NetMeterApp:
                 pass
 
     def check_for_updates(self, manual=False):
-        """Query GitHub Releases API to check for newer version"""
+        """Query GitHub Releases API to check for newer version using certifi SSL context"""
         try:
             url = "https://api.github.com/repos/nazmusweb-coding/net-meter-app/releases/latest"
+
+            # Create secure SSL context using certifi root certificates to fix SSL verification errors on client machines
+            context = ssl.create_default_context(cafile=certifi.where())
+
             req = urllib.request.Request(url, headers={'User-Agent': 'NetMeterApp'})
-            with urllib.request.urlopen(req, timeout=5) as response:
+            with urllib.request.urlopen(req, context=context, timeout=5) as response:
                 data = json.loads(response.read().decode())
                 latest_tag = data.get("tag_name", "").lstrip('v')
 
@@ -263,8 +269,13 @@ class NetMeterApp:
             temp_dir = os.environ.get('TEMP', os.path.expanduser("~"))
             new_exe_path = os.path.join(temp_dir, "net_meter_new.exe")
 
-            # Download file
-            urllib.request.urlretrieve(download_url, new_exe_path)
+            # Create secure SSL context for downloading as well
+            context = ssl.create_default_context(cafile=certifi.where())
+
+            # Download file securely using context
+            req = urllib.request.Request(download_url, headers={'User-Agent': 'NetMeterApp'})
+            with urllib.request.urlopen(req, context=context) as response, open(new_exe_path, 'wb') as out_file:
+                out_file.write(response.read())
 
             current_exe = sys.executable if getattr(sys, 'frozen', False) else os.path.abspath(__file__)
             bat_path = os.path.join(temp_dir, "update_netmeter.bat")
