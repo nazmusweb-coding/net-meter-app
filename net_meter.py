@@ -33,7 +33,7 @@ def check_single_instance():
 
 
 # Application version for auto-update checks
-CURRENT_VERSION = "1.0.0"
+CURRENT_VERSION = "1.0.1"
 
 # Automatically store the history file securely inside Windows AppData
 if os.name == 'nt':  # Windows
@@ -263,13 +263,13 @@ class NetMeterApp:
             if manual:
                 messagebox.showerror("Update Error", f"Could not check for updates.\n{e}")
 
-    def perform_update(self, download_url, latest_tag):
-        """Download new executable and use helper batch script to bypass file-locking"""
+        def perform_update(self, download_url, latest_tag):
+        """Download new executable and update safely using a detached batch process"""
         try:
             temp_dir = os.environ.get('TEMP', os.path.expanduser("~"))
             new_exe_path = os.path.join(temp_dir, "net_meter_new.exe")
 
-            # Create secure SSL context for downloading as well
+            # Create secure SSL context for downloading
             context = ssl.create_default_context(cafile=certifi.where())
 
             # Download file securely using context
@@ -280,19 +280,34 @@ class NetMeterApp:
             current_exe = sys.executable if getattr(sys, 'frozen', False) else os.path.abspath(__file__)
             bat_path = os.path.join(temp_dir, "update_netmeter.bat")
 
-            # Temporary helper batch script to overwrite running executable and restart
+            # Batch script: Wait for complete exit, use robust replacement, and clean up temp files
             bat_content = f"""
             @echo off
-            timeout /t 2 /nobreak > nul
+            echo Updating Net Meter...
+
+            :wait_app
+            taskkill /f /im "{os.path.basename(current_exe)}" >nul 2>&1
+            timeout /t 3 /nobreak > nul
+
+            :try_move
             move /y "{new_exe_path}" "{current_exe}"
+            if errorlevel 1 (
+                timeout /t 2 /nobreak > nul
+                goto :try_move
+            )
+
+            echo Starting updated app...
             start "" "{current_exe}"
             del "%~f0"
+            exit
             """
             with open(bat_path, "w") as f:
                 f.write(bat_content)
 
-            # Launch batch script silently and terminate app
-            subprocess.Popen(bat_path, shell=True, creationflags=subprocess.CREATE_NO_WINDOW)
+            # Launch batch script in a normal window so it can complete cleanly
+            subprocess.Popen(["cmd.exe", "/c", bat_path], creationflags=0)
+
+            # Terminate current app immediately
             self.root.destroy()
             sys.exit(0)
         except Exception as e:
