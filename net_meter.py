@@ -263,7 +263,7 @@ class NetMeterApp:
             if manual:
                 messagebox.showerror("Update Error", f"Could not check for updates.\n{e}")
 
-        def perform_update(self, download_url, latest_tag):
+    def perform_update(self, download_url, latest_tag):
         """Download new executable and update safely using a detached batch process"""
         try:
             temp_dir = os.environ.get('TEMP', os.path.expanduser("~"))
