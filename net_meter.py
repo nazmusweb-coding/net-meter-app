@@ -33,7 +33,7 @@ def check_single_instance():
 
 
 # Application version for auto-update checks
-CURRENT_VERSION = "1.0.1"
+CURRENT_VERSION = "1.1.0"
 
 # Automatically store the history file securely inside Windows AppData
 if os.name == 'nt':  # Windows
@@ -130,10 +130,10 @@ class NetMeterApp:
         return {}
 
     def save_history(self):
-        """Save history and keep only the last 15 days"""
+        """Save history and keep only the last 30 days"""
         sorted_dates = sorted(self.history.keys(), reverse=True)
-        if len(sorted_dates) > 15:
-            for old_date in sorted_dates[15:]:
+        if len(sorted_dates) > 30:
+            for old_date in sorted_dates[30:]:
                 del self.history[old_date]
 
         with open(HISTORY_FILE, "w") as f:
@@ -322,7 +322,7 @@ class NetMeterApp:
             return
 
         self.history_window = tk.Toplevel(self.root)
-        self.history_window.title("15-Day Data Usage History")
+        self.history_window.title("30-Day Data Usage History")
         self.history_window.geometry("310x540")
         self.history_window.configure(bg="#1e1e1e")
         self.history_window.attributes("-topmost", True)
@@ -421,7 +421,7 @@ class NetMeterApp:
 
         total_label = tk.Label(
             total_frame,
-            text=f"Total (15 Days): {grand_total_str}",
+            text=f"Total (30 Days): {grand_total_str}",
             font=("Consolas", 10, "bold"),
             fg="#00FFCC",
             bg="#252525",
