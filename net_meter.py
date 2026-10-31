@@ -33,7 +33,7 @@ def check_single_instance():
 
 
 # Application version for auto-update checks
-CURRENT_VERSION = "1.1.0"
+CURRENT_VERSION = "1.1.1"
 
 # Automatically store the history file securely inside Windows AppData
 if os.name == 'nt':  # Windows
@@ -130,14 +130,29 @@ class NetMeterApp:
         return {}
 
     def save_history(self):
-        """Save history and keep only the last 30 days"""
+        """Save history safely using an atomic write pattern to prevent corruption on power loss"""
         sorted_dates = sorted(self.history.keys(), reverse=True)
         if len(sorted_dates) > 30:
             for old_date in sorted_dates[30:]:
                 del self.history[old_date]
 
-        with open(HISTORY_FILE, "w") as f:
-            json.dump(self.history, f, indent=4)
+        temp_file = HISTORY_FILE + ".tmp"
+        try:
+            # Write to a temporary file first
+            with open(temp_file, "w") as f:
+                json.dump(self.history, f, indent=4)
+
+            # Safely replace the target file (atomic operation on Windows)
+            if os.path.exists(HISTORY_FILE):
+                os.replace(temp_file, HISTORY_FILE)
+            else:
+                os.rename(temp_file, HISTORY_FILE)
+        except Exception:
+            if os.path.exists(temp_file):
+                try:
+                    os.remove(temp_file)
+                except Exception:
+                    pass
 
     def update_speed(self):
         current_time = time.time()
