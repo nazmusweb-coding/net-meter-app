@@ -7,12 +7,17 @@ import ssl
 import urllib.request
 import urllib.error
 import certifi
+import hashlib
+import math
+import hmac
+import logging
+from logging.handlers import RotatingFileHandler
+import tempfile
 from datetime import datetime, date
-import tkinter as tk
+import tkinter as tf_tk
 from tkinter import messagebox
 import psutil
 import ctypes
-
 
 # -------------------------------------------------------------
 # SINGLE-INSTANCE CHECK (Prevents running multiple windows)
@@ -21,44 +26,300 @@ def check_single_instance():
     """Ensure only one instance of the application runs at a time on Windows."""
     if os.name == 'nt':
         kernel32 = ctypes.windll.kernel32
-        # Create a named system-wide mutex lock
         mutex_name = "NetMeterApp_SingleInstance_Mutex_NazmusSakib"
-        # Try to create the mutex
         global_mutex = kernel32.CreateMutexW(None, False, mutex_name)
-        # ERROR_ALREADY_EXISTS = 183
         if kernel32.GetLastError() == 183:
             sys.exit(0)
         return global_mutex
     return None
 
+# Application version
+CURRENT_VERSION = "2.0.0"
 
-# Application version for auto-update checks
-CURRENT_VERSION = "1.1.1"
-
-# Automatically store the history file securely inside Windows AppData
-if os.name == 'nt':  # Windows
+# Automatically store history files securely inside Windows AppData
+if os.name == 'nt':
     app_data = os.environ.get('APPDATA', os.path.expanduser("~"))
     HISTORY_DIR = os.path.join(app_data, "NetMeterApp")
-else:  # Mac / Linux fallback
+else:
     HISTORY_DIR = os.path.expanduser("~")
 
 os.makedirs(HISTORY_DIR, exist_ok=True)
-HISTORY_FILE = os.path.join(HISTORY_DIR, "net_usage_history.json")
+
+# Four Storage Layers
+MH_FILE = os.path.join(HISTORY_DIR, "net_usage_history.json")
+BU1_FILE = os.path.join(HISTORY_DIR, "net_usage_history.json.bu1")
+BU2_FILE = os.path.join(HISTORY_DIR, "net_usage_history.json.bu2")
+BU3_FILE = os.path.join(HISTORY_DIR, "net_usage_history.json.bu3")
 
 
+
+# -------------------------------------------------------------
+# PERSISTENT LOGGING
+# -------------------------------------------------------------
+LOG_FILE = os.path.join(HISTORY_DIR, "netmeter.log")
+
+logger = logging.getLogger("NetMeterApp")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    try:
+        file_handler = RotatingFileHandler(
+            LOG_FILE, maxBytes=1_000_000, backupCount=3, encoding="utf-8"
+        )
+        file_handler.setFormatter(logging.Formatter(
+            "%(asctime)s | %(levelname)s | %(message)s"
+        ))
+        logger.addHandler(file_handler)
+    except Exception:
+        logger.addHandler(logging.StreamHandler())
+logger.propagate = False
+
+
+# -------------------------------------------------------------
+# STORAGE VALIDATOR & CHECKSUM UTILITIES
+# -------------------------------------------------------------
+SCHEMA_VERSION = 1
+MAX_HISTORY_DAYS = 30
+
+
+def calculate_checksum(schema_version, generation, captured_at, history_dict):
+    """Calculate a deterministic SHA-256 checksum over the stored payload."""
+    payload = {
+        "schema_version": schema_version,
+        "generation": generation,
+        "captured_at": captured_at,
+        "history": history_dict,
+    }
+    canonical = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), allow_nan=False
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _valid_date_key(value):
+    if not isinstance(value, str) or len(value) != 10:
+        return False
+    try:
+        return datetime.strptime(value, "%Y-%m-%d").date().isoformat() == value
+    except ValueError:
+        return False
+
+
+def _clean_history(history, enforce_limit=True):
+    """Validate and return a newest-first, bounded copy of a history mapping."""
+    if not isinstance(history, dict):
+        raise ValueError("History must be a JSON object.")
+
+    cleaned = {}
+    for day, value in history.items():
+        if not _valid_date_key(day):
+            raise ValueError(f"Invalid history date: {day!r}")
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"Invalid usage value for {day}.")
+        if (isinstance(value, float) and not math.isfinite(value)) or value < 0:
+            raise ValueError(f"Usage value for {day} must be finite and non-negative.")
+        cleaned[day] = value
+
+    ordered = dict(sorted(cleaned.items(), key=lambda item: item[0], reverse=True))
+    if enforce_limit and len(ordered) > MAX_HISTORY_DAYS:
+        raise ValueError(f"History exceeds the {MAX_HISTORY_DAYS}-day retention limit.")
+    return ordered
+
+
+def validate_storage_file(filepath):
+    """
+    Validate a storage layer.
+
+    Returns (status, data), where status is VALID, MISSING, EMPTY, READ_ERROR,
+    INVALID_JSON, INVALID_SCHEMA, INVALID_CHECKSUM, INVALID_HISTORY,
+    INVALID_DATES, or INVALID_VALUES. Legacy date dictionaries are accepted
+    and returned as VALID with legacy_format=True so they can be migrated.
+    """
+    if not os.path.exists(filepath):
+        return "MISSING", None
+
+    try:
+        if os.path.getsize(filepath) == 0:
+            return "EMPTY", None
+        with open(filepath, "r", encoding="utf-8") as file:
+            raw = file.read()
+        if not raw.strip():
+            return "EMPTY", None
+        data = json.loads(raw)
+    except (OSError, UnicodeError):
+        return "READ_ERROR", None
+    except (json.JSONDecodeError, ValueError):
+        return "INVALID_JSON", None
+
+    if not isinstance(data, dict):
+        return "INVALID_SCHEMA", None
+
+    # Legacy format: {"YYYY-MM-DD": number, ...}
+    if "history" not in data:
+        try:
+            legacy_history = _clean_history(data, enforce_limit=False)
+            legacy_history = dict(list(legacy_history.items())[:MAX_HISTORY_DAYS])
+            captured_at = datetime.now().isoformat(timespec="microseconds")
+            checksum = calculate_checksum(
+                SCHEMA_VERSION, 1, captured_at, legacy_history
+            )
+            return "VALID", {
+                "schema_version": SCHEMA_VERSION,
+                "generation": 1,
+                "captured_at": captured_at,
+                "history": legacy_history,
+                "checksum": checksum,
+                "legacy_format": True,
+            }
+        except ValueError as exc:
+            message = str(exc)
+            if "date" in message.lower():
+                return "INVALID_DATES", None
+            return "INVALID_VALUES", None
+
+    required = {"schema_version", "generation", "captured_at", "history", "checksum"}
+    if not required.issubset(data):
+        return "INVALID_SCHEMA", None
+
+    schema_version = data["schema_version"]
+    generation = data["generation"]
+    captured_at = data["captured_at"]
+    checksum = data["checksum"]
+
+    # bool is a subclass of int, so explicitly reject it.
+    if (isinstance(schema_version, bool) or not isinstance(schema_version, int)
+            or schema_version != SCHEMA_VERSION
+            or isinstance(generation, bool) or not isinstance(generation, int)
+            or generation < 0):
+        return "INVALID_SCHEMA", None
+
+    if not isinstance(captured_at, str):
+        return "INVALID_SCHEMA", None
+    try:
+        if "T" not in captured_at:
+            return "INVALID_SCHEMA", None
+        datetime.fromisoformat(captured_at)
+    except ValueError:
+        return "INVALID_SCHEMA", None
+
+    if not isinstance(checksum, str) or len(checksum) != 64:
+        return "INVALID_SCHEMA", None
+    try:
+        int(checksum, 16)
+    except ValueError:
+        return "INVALID_SCHEMA", None
+
+    try:
+        history = _clean_history(data["history"], enforce_limit=True)
+    except ValueError as exc:
+        message = str(exc)
+        if "date" in message.lower():
+            return "INVALID_DATES", None
+        if "History must" in message or "exceeds" in message:
+            return "INVALID_HISTORY", None
+        return "INVALID_VALUES", None
+
+    expected = calculate_checksum(
+        schema_version, generation, captured_at, history
+    )
+    if not hmac.compare_digest(checksum.lower(), expected):
+        return "INVALID_CHECKSUM", None
+
+    normalized = dict(data)
+    normalized["history"] = history
+    return "VALID", normalized
+
+
+# -------------------------------------------------------------
+# ATOMIC WRITER WITH OPTIONAL FSYNC
+# -------------------------------------------------------------
+def atomic_save_data(filepath, history_dict, generation=1, use_fsync=False):
+    """
+    Write a complete snapshot through a same-directory temporary file and
+    atomic replace. Returns True only after the replacement succeeds.
+    """
+    temp_file = None
+    try:
+        if isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
+            raise ValueError("Generation must be a non-negative integer.")
+
+        retained_history = _clean_history(history_dict, enforce_limit=False)
+        retained_history = dict(list(retained_history.items())[:MAX_HISTORY_DAYS])
+
+        directory = os.path.dirname(os.path.abspath(filepath))
+        os.makedirs(directory, exist_ok=True)
+
+        captured_at = datetime.now().isoformat(timespec="microseconds")
+        checksum = calculate_checksum(
+            SCHEMA_VERSION, generation, captured_at, retained_history
+        )
+        snapshot = {
+            "schema_version": SCHEMA_VERSION,
+            "generation": generation,
+            "captured_at": captured_at,
+            "history": retained_history,
+            "checksum": checksum,
+        }
+
+        fd, temp_file = tempfile.mkstemp(
+            prefix=f".{os.path.basename(filepath)}.",
+            suffix=".tmp",
+            dir=directory,
+        )
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as file:
+            json.dump(snapshot, file, indent=4, allow_nan=False)
+            file.flush()
+            if use_fsync:
+                os.fsync(file.fileno())
+
+        temp_status, _ = validate_storage_file(temp_file)
+        if temp_status != "VALID":
+            raise IOError(f"Temporary snapshot validation failed: {temp_status}")
+
+        os.replace(temp_file, filepath)
+        temp_file = None
+
+        if use_fsync and hasattr(os, "O_DIRECTORY"):
+            try:
+                dir_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
+            except OSError as exc:
+                logger.warning("Directory fsync unavailable for %s: %s", directory, exc)
+
+        logger.info(
+            "Storage write succeeded: %s | generation=%s | fsync=%s",
+            filepath, generation, use_fsync
+        )
+        return True
+
+    except Exception:
+        logger.exception("Storage write failed: %s", filepath)
+        return False
+    finally:
+        if temp_file and os.path.exists(temp_file):
+            try:
+                os.remove(temp_file)
+            except OSError:
+                logger.exception("Could not remove temporary file: %s", temp_file)
+
+
+# -------------------------------------------------------------
+# APPLICATION MAIN CLASS
+# -------------------------------------------------------------
 class NetMeterApp:
     def __init__(self, root):
         self.root = root
-        self.root.overrideredirect(True)  # Remove window borders/title bar
-        self.root.attributes("-topmost", True)  # Keep window always on top
-        self.root.attributes("-alpha", 0.88)  # Slightly transparent
+        self.root.overrideredirect(True)
+        self.root.attributes("-topmost", True)
+        self.root.attributes("-alpha", 0.88)
         self.root.configure(bg="#222222")
 
-        # Track the history settings window instance to prevent multiple popups
         self.history_window = None
+        self.current_generation = 1
 
-        # Label to display the speed and session usage
-        self.label = tk.Label(
+        self.label = tf_tk.Label(
             root,
             text="Initializing...",
             font=("Consolas", 9, "bold"),
@@ -70,28 +331,31 @@ class NetMeterApp:
         )
         self.label.pack()
 
-        # Enable dragging the window around with single click
         self.label.bind("<Button-1>", self.start_move)
         self.label.bind("<B1-Motion>", self.do_move)
-
-        # Enable opening history dashboard with a double-click
         self.label.bind("<Double-Button-1>", self.open_history_window)
 
-        # Initialize network counters and time for speed calculation
         self.last_net = psutil.net_io_counters()
         self.last_time = time.time()
 
-        # Track session data safely using accumulated counters
         self.session_dl = 0
         self.session_ul = 0
 
-        # Load historical usage data
-        self.history = self.load_history()
+        # Startup recovery sequence & initial load
+        self.history, self.current_generation = self.startup_recovery_sequence()
 
-        # Start update loop
+        # Start main update loop (MH event-driven/1s check)
         self.update_speed()
 
-        # Silently check for updates in the background on startup
+        # Start independent staggered backup timers
+        # BU1: 15s initial delay -> 300s (5 min) interval
+        self.root.after(15000, self.schedule_backup_1)
+        # BU2: 30s initial delay -> 720s (12 min) interval
+        self.root.after(30000, self.schedule_backup_2)
+        # BU3: 45s initial delay -> 1020s (17 min) interval
+        self.root.after(45000, self.schedule_backup_3)
+
+        # Check for updates in background
         self.root.after(3000, lambda: self.check_for_updates(manual=False))
 
     def start_move(self, event):
@@ -104,14 +368,12 @@ class NetMeterApp:
         self.root.geometry(f"+{x}+{y}")
 
     def format_speed(self, speed_bytes):
-        """Convert bytes/sec to KB/s or MB/s"""
         speed_kb = speed_bytes / 1024
         if speed_kb > 1024:
             return f"{speed_kb / 1024:.2f} MB/s"
         return f"{speed_kb:.1f} KB/s"
 
     def format_size(self, size_bytes):
-        """Convert total bytes to KB, MB, or GB"""
         size_kb = size_bytes / 1024
         if size_kb > 1024 * 1024:
             return f"{size_kb / (1024 * 1024):.2f} GB"
@@ -119,40 +381,192 @@ class NetMeterApp:
             return f"{size_kb / 1024:.2f} MB"
         return f"{size_kb:.1f} KB"
 
-    def load_history(self):
-        """Load history from JSON file or create empty dict"""
-        if os.path.exists(HISTORY_FILE):
+    def startup_recovery_sequence(self):
+        statuses = {}
+        records = {}
+        for name, path in (
+            ("MH", MH_FILE), ("BU1", BU1_FILE),
+            ("BU2", BU2_FILE), ("BU3", BU3_FILE)
+        ):
+            status, data = validate_storage_file(path)
+            statuses[name] = status
+            if status == "VALID":
+                records[name] = data
+
+        logger.info(
+            "Recovery audit | MH=%s BU1=%s BU2=%s BU3=%s",
+            statuses["MH"], statuses["BU1"], statuses["BU2"], statuses["BU3"]
+        )
+
+        mh_valid = "MH" in records
+        selected_name = None
+        selected_data = None
+        needs_fsync = False
+
+        if mh_valid:
+            mh_generation = records["MH"]["generation"]
+            newer_backups = [
+                name for name in ("BU1", "BU2", "BU3")
+                if name in records and records[name]["generation"] > mh_generation
+            ]
+            if newer_backups:
+                selected_name = max(
+                    newer_backups,
+                    key=lambda name: (
+                        records[name]["generation"],
+                        -("BU1", "BU2", "BU3").index(name)
+                    )
+                )
+                selected_data = records[selected_name]
+                logger.warning(
+                    "Option B: %s generation %s is newer than MH generation %s; "
+                    "the backup will supersede MH.",
+                    selected_name, selected_data["generation"], mh_generation
+                )
+            else:
+                selected_name = "MH"
+                selected_data = records["MH"]
+                logger.info("Valid MH selected; no backup has a higher generation.")
+
+        else:
+            bu1_valid = "BU1" in records
+            bu2_valid = "BU2" in records
+            bu3_valid = "BU3" in records
+
+            if not bu1_valid and not bu3_valid and bu2_valid:
+                selected_name, needs_fsync = "BU2", True
+                logger.warning("Recovery matrix: MH + BU3 + BU1 unavailable -> BU2 (fsync).")
+            elif not bu1_valid and not bu2_valid and bu3_valid:
+                selected_name, needs_fsync = "BU3", True
+                logger.warning("Recovery matrix: MH + BU1 + BU2 unavailable -> BU3 (fsync).")
+            elif not bu1_valid and bu2_valid:
+                selected_name, needs_fsync = "BU2", False
+                logger.warning("Recovery matrix: MH + BU1 unavailable -> BU2.")
+            elif bu1_valid and not bu2_valid:
+                selected_name, needs_fsync = "BU1", False
+                logger.warning("Recovery matrix: MH + BU2 unavailable -> BU1.")
+            elif bu1_valid and not bu3_valid:
+                selected_name, needs_fsync = "BU1", False
+                logger.warning("Recovery matrix: MH + BU3 unavailable -> BU1.")
+            else:
+                logger.warning(
+                    "Unlisted recovery combination; applying fallback BU1 > BU2 > BU3."
+                )
+                if bu1_valid:
+                    selected_name, needs_fsync = "BU1", False
+                elif bu2_valid:
+                    selected_name, needs_fsync = "BU2", True
+                elif bu3_valid:
+                    selected_name, needs_fsync = "BU3", True
+
+            if selected_name:
+                selected_data = records[selected_name]
+
+        if selected_data is None:
+            logger.critical(
+                "All storage layers are unavailable or invalid. Starting with empty history."
+            )
+            empty_saved = atomic_save_data(MH_FILE, {}, generation=1, use_fsync=True)
+            if not empty_saved:
+                logger.critical("Could not initialize an empty MH storage file.")
             try:
-                with open(HISTORY_FILE, "r") as f:
-                    return json.load(f)
+                messagebox.showwarning(
+                    "NetMeterApp Data Recovery",
+                    "No valid usage-history file or backup was found. "
+                    "The application will start with empty history. "
+                    "Check the NetMeterApp log for details."
+                )
             except Exception:
-                return {}
-        return {}
+                logger.exception("Could not display the recovery warning.")
+            return {}, 1
+
+        recovered_history = dict(selected_data["history"])
+        source_generation = selected_data["generation"]
+
+        if selected_name == "MH":
+            if selected_data.get("legacy_format"):
+                migrated = atomic_save_data(
+                    MH_FILE, recovered_history, generation=source_generation,
+                    use_fsync=True
+                )
+                if not migrated:
+                    logger.error("Legacy MH migration failed; using validated data in memory.")
+            logger.info("Recovery complete from MH at generation %s.", source_generation)
+            return recovered_history, source_generation
+
+        restored_generation = source_generation + 1
+        restored = atomic_save_data(
+            MH_FILE, recovered_history,
+            generation=restored_generation,
+            use_fsync=needs_fsync
+        )
+        if restored:
+            logger.info(
+                "Recovery succeeded: MH restored from %s at generation %s.",
+                selected_name, restored_generation
+            )
+        else:
+            logger.error(
+                "Recovery source %s is valid, but restoring MH failed. "
+                "Continuing with recovered data in memory.",
+                selected_name
+            )
+            try:
+                messagebox.showwarning(
+                    "NetMeterApp Recovery Warning",
+                    f"History was loaded from {selected_name}, but the primary "
+                    "history file could not be restored. The app will continue "
+                    "using recovered data in memory. Check disk permissions and "
+                    "the NetMeterApp log."
+                )
+            except Exception:
+                logger.exception("Could not display the MH restore warning.")
+
+        return recovered_history, restored_generation
 
     def save_history(self):
-        """Save history safely using an atomic write pattern to prevent corruption on power loss"""
-        sorted_dates = sorted(self.history.keys(), reverse=True)
-        if len(sorted_dates) > 30:
-            for old_date in sorted_dates[30:]:
-                del self.history[old_date]
+        self.history = dict(sorted(
+            self.history.items(), key=lambda item: item[0], reverse=True
+        )[:MAX_HISTORY_DAYS])
+        self.current_generation += 1
+        saved = atomic_save_data(
+            MH_FILE, self.history,
+            generation=self.current_generation,
+            use_fsync=False
+        )
+        if not saved:
+            logger.error(
+                "MH save failed at generation %s; a later backup may still "
+                "persist this in-memory generation.",
+                self.current_generation
+            )
+        return saved
 
-        temp_file = HISTORY_FILE + ".tmp"
+    def _save_backup(self, backup_name, backup_path, fsync=False):
         try:
-            # Write to a temporary file first
-            with open(temp_file, "w") as f:
-                json.dump(self.history, f, indent=4)
-
-            # Safely replace the target file (atomic operation on Windows)
-            if os.path.exists(HISTORY_FILE):
-                os.replace(temp_file, HISTORY_FILE)
-            else:
-                os.rename(temp_file, HISTORY_FILE)
+            saved = atomic_save_data(
+                backup_path, self.history,
+                generation=self.current_generation,
+                use_fsync=fsync
+            )
+            if not saved:
+                logger.error("%s scheduled backup failed.", backup_name)
+            return saved
         except Exception:
-            if os.path.exists(temp_file):
-                try:
-                    os.remove(temp_file)
-                except Exception:
-                    pass
+            logger.exception("%s scheduled backup raised an exception.", backup_name)
+            return False
+
+    def schedule_backup_1(self):
+        self._save_backup("BU1", BU1_FILE, fsync=False)
+        self.root.after(300000, self.schedule_backup_1)
+
+    def schedule_backup_2(self):
+        self._save_backup("BU2", BU2_FILE, fsync=False)
+        self.root.after(720000, self.schedule_backup_2)
+
+    def schedule_backup_3(self):
+        self._save_backup("BU3", BU3_FILE, fsync=False)
+        self.root.after(1020000, self.schedule_backup_3)
 
     def update_speed(self):
         current_time = time.time()
@@ -160,37 +574,35 @@ class NetMeterApp:
 
         time_delta = current_time - self.last_time
         if time_delta > 0:
-            # Calculate instantaneous speeds
             download_speed = max(0, (current_net.bytes_recv - self.last_net.bytes_recv) / time_delta)
             upload_speed = max(0, (current_net.bytes_sent - self.last_net.bytes_sent) / time_delta)
 
-            # Calculate bytes transferred in this specific 1-second tick (deltas)
             dl_delta = current_net.bytes_recv - self.last_net.bytes_recv
             ul_delta = current_net.bytes_sent - self.last_net.bytes_sent
 
-            # Accumulate download and upload usage safely
+            today_str = str(date.today())
+            activity_detected = False
+
             if dl_delta > 0:
                 self.session_dl += dl_delta
-                today_str = str(date.today())
                 if today_str not in self.history:
                     self.history[today_str] = 0
                 self.history[today_str] += dl_delta
+                activity_detected = True
 
             if ul_delta > 0:
                 self.session_ul += ul_delta
-                today_str = str(date.today())
                 if today_str not in self.history:
                     self.history[today_str] = 0
                 self.history[today_str] += ul_delta
+                activity_detected = True
 
-            if dl_delta > 0 or ul_delta > 0:
+            if activity_detected:
                 self.save_history()
 
-            # Update tracking variables for next loop
             self.last_net = current_net
             self.last_time = time.time()
 
-            # Format strings
             dl_str = self.format_speed(download_speed)
             ul_str = self.format_speed(upload_speed)
             session_dl_str = self.format_size(self.session_dl)
@@ -203,31 +615,26 @@ class NetMeterApp:
             )
             self.label.config(text=display_text)
 
-        # Refresh every 1 second
         self.root.after(1000, self.update_speed)
 
     def get_startup_shortcut_path(self):
-        """Get the path to the shortcut inside the Windows Startup folder"""
         if os.name == 'nt':
             startup_dir = os.path.join(os.environ.get('APPDATA', ''), r'Microsoft\Windows\Start Menu\Programs\Startup')
             return os.path.join(startup_dir, "NetMeterApp.lnk")
         return None
 
     def toggle_startup(self, btn_widget):
-        """Enable or disable starting with Windows programmatically"""
         shortcut_path = self.get_startup_shortcut_path()
         if not shortcut_path:
             return
 
         if os.path.exists(shortcut_path):
-            # Disable: Remove shortcut
             try:
                 os.remove(shortcut_path)
             except Exception:
                 pass
             btn_widget.config(text="Start with Windows: OFF", bg="#333333", fg="#ffffff")
         else:
-            # Enable: Create shortcut using PowerShell
             target_path = sys.executable if getattr(sys, 'frozen', False) else os.path.abspath(__file__)
             ps_script = f"""
             $WScript = New-Object -ComObject WScript.Shell
@@ -243,13 +650,9 @@ class NetMeterApp:
                 pass
 
     def check_for_updates(self, manual=False):
-        """Query GitHub Releases API to check for newer version using certifi SSL context"""
         try:
             url = "https://api.github.com/repos/nazmusweb-coding/net-meter-app/releases/latest"
-
-            # Create secure SSL context using certifi root certificates to fix SSL verification errors on client machines
             context = ssl.create_default_context(cafile=certifi.where())
-
             req = urllib.request.Request(url, headers={'User-Agent': 'NetMeterApp'})
             with urllib.request.urlopen(req, context=context, timeout=5) as response:
                 data = json.loads(response.read().decode())
@@ -269,8 +672,7 @@ class NetMeterApp:
                             self.perform_update(download_url, latest_tag)
                     else:
                         if manual:
-                            messagebox.showinfo("Update",
-                                                "New release found on GitHub, but 'net_meter.exe' asset is missing.")
+                            messagebox.showinfo("Update", "New release found on GitHub, but 'net_meter.exe' asset is missing.")
                 else:
                     if manual:
                         messagebox.showinfo("Up to Date", f"You are using the latest version ({CURRENT_VERSION}).")
@@ -279,15 +681,10 @@ class NetMeterApp:
                 messagebox.showerror("Update Error", f"Could not check for updates.\n{e}")
 
     def perform_update(self, download_url, latest_tag):
-        """Download new executable and update safely using a detached batch process"""
         try:
             temp_dir = os.environ.get('TEMP', os.path.expanduser("~"))
             new_exe_path = os.path.join(temp_dir, "net_meter_new.exe")
-
-            # Create secure SSL context for downloading
             context = ssl.create_default_context(cafile=certifi.where())
-
-            # Download file securely using context
             req = urllib.request.Request(download_url, headers={'User-Agent': 'NetMeterApp'})
             with urllib.request.urlopen(req, context=context) as response, open(new_exe_path, 'wb') as out_file:
                 out_file.write(response.read())
@@ -295,22 +692,18 @@ class NetMeterApp:
             current_exe = sys.executable if getattr(sys, 'frozen', False) else os.path.abspath(__file__)
             bat_path = os.path.join(temp_dir, "update_netmeter.bat")
 
-            # Batch script: Wait for complete exit, use robust replacement, and clean up temp files
             bat_content = f"""
             @echo off
             echo Updating Net Meter...
-
             :wait_app
             taskkill /f /im "{os.path.basename(current_exe)}" >nul 2>&1
             timeout /t 3 /nobreak > nul
-
             :try_move
             move /y "{new_exe_path}" "{current_exe}"
             if errorlevel 1 (
                 timeout /t 2 /nobreak > nul
                 goto :try_move
             )
-
             echo Starting updated app...
             start "" "{current_exe}"
             del "%~f0"
@@ -319,30 +712,24 @@ class NetMeterApp:
             with open(bat_path, "w") as f:
                 f.write(bat_content)
 
-            # Launch batch script in a normal window so it can complete cleanly
             subprocess.Popen(["cmd.exe", "/c", bat_path], creationflags=0)
-
-            # Terminate current app immediately
             self.root.destroy()
             sys.exit(0)
         except Exception as e:
             messagebox.showerror("Update Failed", f"An error occurred during update:\n{e}")
 
     def open_history_window(self, event):
-        """Open settings & history dashboard ensuring only one window exists at a time"""
-        # If the window already exists and is open, bring it to focus instead of opening a new one
-        if self.history_window is not None and tk.Toplevel.winfo_exists(self.history_window):
+        if self.history_window is not None and self.history_window.winfo_exists():
             self.history_window.lift()
             self.history_window.focus_force()
             return
 
-        self.history_window = tk.Toplevel(self.root)
+        self.history_window = tf_tk.Toplevel(self.root)
         self.history_window.title("30-Day Data Usage History")
         self.history_window.geometry("310x540")
         self.history_window.configure(bg="#1e1e1e")
         self.history_window.attributes("-topmost", True)
 
-        # Clear reference when closed
         def on_close():
             if self.history_window:
                 self.history_window.destroy()
@@ -350,8 +737,7 @@ class NetMeterApp:
 
         self.history_window.protocol("WM_DELETE_WINDOW", on_close)
 
-        # Title at the top
-        title_label = tk.Label(
+        title_label = tf_tk.Label(
             self.history_window,
             text="Recent Total Consumption",
             font=("Consolas", 11, "bold"),
@@ -361,11 +747,10 @@ class NetMeterApp:
         )
         title_label.pack(side="top")
 
-        # Buttons at the bottom
-        btn_frame = tk.Frame(self.history_window, bg="#1e1e1e")
+        btn_frame = tf_tk.Frame(self.history_window, bg="#1e1e1e")
         btn_frame.pack(side="bottom", pady=8)
 
-        close_btn = tk.Button(
+        close_btn = tf_tk.Button(
             btn_frame,
             text="Close Menu",
             command=on_close,
@@ -378,7 +763,7 @@ class NetMeterApp:
         )
         close_btn.pack(side="left", padx=5)
 
-        quit_btn = tk.Button(
+        quit_btn = tf_tk.Button(
             btn_frame,
             text="Quit App",
             command=self.root.destroy,
@@ -391,8 +776,7 @@ class NetMeterApp:
         )
         quit_btn.pack(side="left", padx=5)
 
-        # Manual Check for Updates Button
-        update_btn = tk.Button(
+        update_btn = tf_tk.Button(
             self.history_window,
             text=f"Check for Updates (v{CURRENT_VERSION})",
             font=("Consolas", 9, "bold"),
@@ -405,7 +789,6 @@ class NetMeterApp:
         )
         update_btn.pack(side="bottom", fill="x", padx=15, pady=2)
 
-        # Startup Toggle Button
         shortcut_path = self.get_startup_shortcut_path()
         is_startup_enabled = shortcut_path and os.path.exists(shortcut_path)
 
@@ -413,7 +796,7 @@ class NetMeterApp:
         startup_btn_bg = "#005533" if is_startup_enabled else "#333333"
         startup_btn_fg = "#00FFCC" if is_startup_enabled else "#ffffff"
 
-        startup_btn = tk.Button(
+        startup_btn = tf_tk.Button(
             self.history_window,
             text=startup_btn_text,
             font=("Consolas", 9, "bold"),
@@ -426,15 +809,14 @@ class NetMeterApp:
         )
         startup_btn.pack(side="bottom", fill="x", padx=15, pady=2)
 
-        # Calculate Grand Total and create summary box
         sorted_dates = sorted(self.history.keys(), reverse=True)
         grand_total_bytes = sum(self.history[d] for d in sorted_dates)
         grand_total_str = self.format_size(grand_total_bytes)
 
-        total_frame = tk.Frame(self.history_window, bg="#252525", bd=1, relief="solid")
+        total_frame = tf_tk.Frame(self.history_window, bg="#252525", bd=1, relief="solid")
         total_frame.pack(side="bottom", fill="x", padx=10, pady=4)
 
-        total_label = tk.Label(
+        total_label = tf_tk.Label(
             total_frame,
             text=f"Total (30 Days): {grand_total_str}",
             font=("Consolas", 10, "bold"),
@@ -446,26 +828,23 @@ class NetMeterApp:
         )
         total_label.pack(fill="x")
 
-        # Scrollable container for dates
-        container = tk.Frame(self.history_window, bg="#1e1e1e")
+        container = tf_tk.Frame(self.history_window, bg="#1e1e1e")
         container.pack(side="top", fill="both", expand=True, padx=10, pady=2)
 
-        canvas = tk.Canvas(container, bg="#1e1e1e", highlightthickness=0)
-        scrollbar = tk.Scrollbar(container, orient="vertical", command=canvas.yview)
-        scrollable_frame = tk.Frame(canvas, bg="#1e1e1e")
+        canvas = tf_tk.Canvas(container, bg="#1e1e1e", highlightthickness=0)
+        scrollbar = tf_tk.Scrollbar(container, orient="vertical", command=canvas.yview)
+        scrollable_frame = tf_tk.Frame(canvas, bg="#1e1e1e")
 
         def configure_interior(event):
             canvas.configure(scrollregion=canvas.bbox("all"))
 
         scrollable_frame.bind("<Configure>", configure_interior)
-
         canvas_window = canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
 
         def configure_canvas(event):
             canvas.itemconfig(canvas_window, width=event.width)
 
         canvas.bind("<Configure>", configure_canvas)
-
         canvas.configure(yscrollcommand=scrollbar.set)
 
         canvas.pack(side="left", fill="both", expand=True)
@@ -477,7 +856,7 @@ class NetMeterApp:
         canvas.bind_all("<MouseWheel>", _on_mousewheel)
 
         if not sorted_dates:
-            no_data_label = tk.Label(
+            no_data_label = tf_tk.Label(
                 scrollable_frame,
                 text="No history recorded yet.",
                 font=("Consolas", 9),
@@ -491,7 +870,7 @@ class NetMeterApp:
                 size_str = self.format_size(total_bytes)
 
                 row_text = f"{d}  ➔  {size_str}"
-                row_label = tk.Label(
+                row_label = tf_tk.Label(
                     scrollable_frame,
                     text=row_text,
                     font=("Consolas", 10),
@@ -505,10 +884,8 @@ class NetMeterApp:
 
 
 if __name__ == "__main__":
-    # Enforce single instance execution
     mutex_lock = check_single_instance()
-
-    root = tk.Tk()
+    root = tf_tk.Tk()
     root.geometry("+100+100")
     app = NetMeterApp(root)
     root.mainloop()
