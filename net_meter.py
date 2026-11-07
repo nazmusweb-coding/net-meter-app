@@ -34,7 +34,7 @@ def check_single_instance():
     return None
 
 # Application version
-CURRENT_VERSION = "2.0.0"
+CURRENT_VERSION = "2.0.1"
 
 # Automatically store history files securely inside Windows AppData
 if os.name == 'nt':
@@ -316,6 +316,9 @@ class NetMeterApp:
         self.root.attributes("-alpha", 0.88)
         self.root.configure(bg="#222222")
 
+        # Force high priority topmost window via Win32 API
+        self.enforce_top_priority()
+
         self.history_window = None
         self.current_generation = 1
 
@@ -357,6 +360,19 @@ class NetMeterApp:
 
         # Check for updates in background
         self.root.after(3000, lambda: self.check_for_updates(manual=False))
+
+    def enforce_top_priority(self):
+        """Win32 API force-pin solution to ensure absolute topmost Z-order priority."""
+        if os.name == 'nt':
+            try:
+                hwnd = self.root.winfo_id()
+                # HWND_TOPMOST = -1
+                # SWP_NOSIZE = 0x0001, SWP_NOMOVE = 0x0002, SWP_SHOWWINDOW = 0x0040
+                ctypes.windll.user32.SetWindowPos(hwnd, -1, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0040)
+            except Exception:
+                pass
+        # Re-enforce periodically (every 2.5 seconds) to beat competing topmost applications
+        self.root.after(2500, self.enforce_top_priority)
 
     def start_move(self, event):
         self.x = event.x
